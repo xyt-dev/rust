@@ -68,6 +68,7 @@ pub fn register_builtin_macros(resolver: &mut dyn ResolverExpand) {
         $(register(sym::$name, SyntaxExtensionKind::LegacyDerive(Arc::new(BuiltinDerive($f))));)*
     }
 
+    // let s = sym::format_args; // compiler/rustc_span/src/symbol.rs
     register_bang! {
         // tidy-alphabetical-start
         asm: asm::expand_asm,
