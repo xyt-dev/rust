@@ -24,6 +24,64 @@
 //! CFG_RELEASE="0.0.0" cargo +nightly expand > /tmp/rustc_span.rs
 //! ```
 
+// ═══════════════════════════════════════════════════════════════════════════
+// 【前置概念:字符串驻留(string interning)——读本文件前必须先懂】
+//
+// ─── 1. 问题:编译器怎么表示"名字" ───
+// 一次编译要处理上亿次标识符操作:每个名字(`len`、`self`、你的变量名)
+// 在词法、语法、类型检查各阶段被反复比较、哈希、存进各种表。若用 String
+// 表示名字,则同一个名字要存几万份副本,且每次比较都要逐字节扫描——
+// 这两笔开销在编译器的数量级下不可接受。
+//
+// ─── 2. 方案:Interner(驻留器) + Symbol(u32 编号) ───
+// 全局维护一张表(实现在 rustc_span/src/symbol.rs 的 `Interner`):
+//   - 每个**不同**的字符串只存一份(集中放在 arena 里),分配一个 u32 编号;
+//   - 第一次 intern("count") → 登记并发新号;之后再 intern("count") →
+//     查表返回**同一个**编号;
+//   - 编译器内部一律传递 4 字节的 `Symbol`(编号的包装类型):
+//     比较 == 整数比较,哈希 == 整数哈希;只有需要显示时才用 as_str()
+//     按编号把字符串查回来。
+// Interner 内部结构 = arena(字符串本体) + 哈希表(字符串→编号,intern 用)
+// + Vec(编号→字符串,as_str 按下标用)。
+//
+// ─── 3. 驻留发生在何时:是内存表示,不是代码变换 ───
+// 并没有"先把源码里的符号统一改成数字再编译"的独立步骤,源文件一个字节
+// 都不变。实际过程是:lexer 逐字符扫源码,每切出一个标识符**当场** intern,
+// 产出的 token 里装的已经是 Symbol 而非字符串;此后 AST/HIR 等所有数据
+// 结构里的名字都是 Symbol。类比数据库:不会把你的姓名改成数字,但内部
+// 用主键 ID 做关联,姓名只在最终显示时才查出来。
+//   注意:Symbol 只回答"两个标识符的**名字**相同吗",不回答"它们是同一个
+//   变量吗"——后者是名字解析(resolve)阶段的事。驻留是纯字符串去重,
+//   不携带任何语义。
+//
+// ─── 4. 分清两个"编译期" ───
+//   (a) 编译 rustc 自身之时——本宏在这一刻展开,给预定义符号定死编号;
+//   (b) rustc 进程运行(即它在编译你的程序)之时——Interner 这一刻才被
+//       创建,你代码里的名字这一刻才被逐个 intern。
+// 预定义的几千个名字(关键字、`main`、`Some`、各种属性名……)在 (a) 拿到
+// 固定编号;你自己起的名字在 (b) 从 PREDEFINED_SYMBOLS_COUNT 往后动态发号,
+// 两个区间互不冲突。
+//
+// ─── 5. 本宏的角色:用 prefill 让编译期常量与运行期表对齐 ───
+// 矛盾:Interner 的编号本是"谁先被 intern 谁拿小号",取决于运行期调用
+// 顺序;但 rustc 源码想把 sym::xxx 当**编译期常量**用(写进 match 分支、
+// 零开销比较),编号就必须在 (a) 提前定死。解法叫 prefill(预先填充):
+//   - 编译期(本文件的宏):按固定顺序遍历所有预定义符号,第 i 个发编号 i,
+//     同时把字符串按**同一顺序**写进 prefill 数组,嵌入生成的代码;
+//   - 运行期(symbol.rs 的 Interner::prefill):按同一顺序把该数组填进表,
+//     第 i 个字符串进 Vec 第 i 格,哈希表登记 (字符串 → i)。
+// 两边共享同一份顺序,"编号 ↔ 字符串"天然一致:这份顺序在编译期物化成
+// 常量,在运行期物化成表的内容。运行期 intern("abi") 会命中 prefill 登记
+// 的条目,返回与 sym::abi 相同的编号——常量路径与动态路径殊途同归。
+//
+// ─── 6. 本宏的三样产物 ───
+//   1) kw_generated / sym_generated 两个模块:一排排
+//      `pub const 名字: Symbol = Symbol::new(编号);` 常量
+//      (经 symbol.rs 的 `pub use` 转发,就是全编译器在用的 kw::/sym::);
+//   2) Interner::with_extra_symbols():内含上述 prefill 字符串数组;
+//   3) SYMBOL_DIGITS_BASE 等基址常量(单字符符号的 O(1) 快速通道)。
+// ═══════════════════════════════════════════════════════════════════════════
+
 use std::collections::HashMap;
 
 use proc_macro2::{Span, TokenStream};
@@ -177,14 +235,10 @@ impl Entries {
 // 【带读】symbols_with_errors —— `symbols!` 宏的真正主体
 //
 // 职责一句话:把 rustc_span/src/symbol.rs:24 处
-// `symbols! { Keywords{..} Symbols{..} }` 的输入 token 流,变成三样产物
-// (最后全部拼进返回的 TokenStream):
-//   1. kw_generated / sym_generated 两个模块,内容是一排排
-//      `pub const 名字: Symbol = Symbol::new(编号);` 常量
-//      (经 symbol.rs 里 `pub use` 转发后,就是全编译器在用的 kw::/sym::);
-//   2. Interner::with_extra_symbols(),内含 prefill 字符串数组——
-//      数组第 idx 个字符串 == 编号为 idx 的那个符号(顺序即编号!);
-//   3. 几个基址常量(SYMBOL_DIGITS_BASE 等,给单字符符号的 O(1) 快速通道用)。
+// `symbols! { Keywords{..} Symbols{..} }` 的输入 token 流,变成文件顶部
+// 【前置概念】第 6 节所列的三样产物(常量模块 + prefill 数组 + 基址常量),
+// 全部拼进返回的 TokenStream。为什么需要这些产物、prefill 如何让编译期
+// 常量与运行期驻留表对齐,见顶部第 2/5 节——没读过请先回去读。
 //
 // ★ 全函数唯一的核心不变量:每给 entries 发一个编号,必须同步往
 //   prefill_stream 推入对应字符串,且顺序严格一致。因为运行期
@@ -236,13 +290,9 @@ fn symbols_with_errors(input: TokenStream) -> (TokenStream, Vec<syn::Error>) {
     // 插进去(类似 format! 的 {} 占位)。这种"整体引用 + 局部插值"的写法,
     // 术语叫 quasi-quoting(准引用)。
     //
-    // 【名词解释:prefill 为什么叫 prefill】
-    // pre-fill = "预先填充"。Interner(字符串驻留器)本来的工作方式是运行期
-    // 按需登记:每次 intern("xxx") 时查表,没有才分配新编号。而本宏在编译
-    // rustc 时就已经把编号发好了(写死在 sym::xxx 常量里),所以 Interner
-    // 创建的那一刻,必须把全部预定义字符串按同样的顺序一次性填进表——
-    // "在使用之前预先填好",故名 prefill。这样 sym::abi 里那个编译期写死的
-    // 编号,从程序第 0 秒起就能查到对应字符串。
+    // Interner 是什么、prefill 为何存在及其完整逻辑,已在文件顶部
+    // 【前置概念】第 2/5 节系统讲解——prefill_stream 攒的就是那份
+    // "顺序即编号"的字符串数组,本函数后面所有循环都在维护它。
     let mut keyword_stream = quote! {};
     let mut symbols_stream = quote! {};
     let mut prefill_stream = quote! {};
